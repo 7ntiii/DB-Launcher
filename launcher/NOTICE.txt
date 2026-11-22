@@ -3,6 +3,8 @@ DB-LAUNCHER - LICENSES AND CREDITS
 This project is free software under the GNU General Public License, version 3 or (at your option) any
 later version. The full text is in LICENSE.txt. It comes with NO WARRANTY.
 
+The project's repository, with the source of everything that is ours: https://github.com/7ntiii/DB-Launcher
+
 WHAT IS IN A PACKAGE, AND WHOSE IT IS
 
 1. The launcher ("DB-Launcher Host.exe", "DB-Launcher Join.exe"; source: the "launcher" folder of the
