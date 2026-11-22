@@ -1,0 +1,6 @@
+Emulator: Lichii (https://github.com/zortos293/Lichii), GPL-3.0-or-later.
+Base commit: 7088f677d2f65c338a5e72854a693af6ff624608
+Our branch at export: merge-366
+
+Apply duskbloods-lan.patch, then local-changes.patch, on that commit (git apply), and build as the
+emulator's own README says. The two patches hold every change of this project to the emulator.

@@ -1,0 +1,893 @@
+--- a/frontend_api.py
++++ b/frontend_api.py
+@@ -57,34 +57,35 @@
+ # --- online play: players who registered the same room password are matched together ------------
+ # Only active when the launcher starts the servers in online mode (DUSK_ONLINE=1). The room is a
+ # hash made by the launcher (the password itself never reaches this server).
+-#
+-# How the game searches (host logs, 2026-11-08): RequestMatchingTicket, then
+-# RequestWaitForMatchingTicketResult about every 2 s, 4 times (~6 s); with no MATCHED it drops that
+-# ticket and makes a new one ~10 s later. So a search is tracked per PLAYER across tickets, a match is
+-# formed among players still searching, and each member gets MATCHED on its next poll or ticket.
+-import re, secrets, threading, time
++import re, threading, time
+ 
+ ONLINE = os.environ.get('DUSK_ONLINE') == '1'
+-BOTS_EVERYWHERE = os.environ.get('DUSK_BOTS') == '1'      # practice: every room is a bots room
+ P2P_FORMAT = os.environ.get('DUSK_P2P_FORMAT', 'ip4')   # ip4 | ip4port | pid | empty (what p2p_host_info holds)
+ P2P_PORT = int(os.environ.get('DUSK_P2P_PORT', '0'))
+-MIN_PLAYERS = max(1, int(os.environ.get('DUSK_MATCH_MIN', '2')))   # the game allows up to 8; 2 to play together
++MIN_PLAYERS = int(os.environ.get('DUSK_MATCH_MIN', '2'))
+ MAX_PLAYERS = int(os.environ.get('DUSK_MATCH_MAX', '8'))
+-WAIT_SECONDS = float(os.environ.get('DUSK_MATCH_WAIT', '20'))  # wait this long for everyone in the room
+-SEARCH_TTL = float(os.environ.get('DUSK_SEARCH_TTL', '20'))     # a search nobody touched this long ended
+-PRESENT_SECONDS = float(os.environ.get('DUSK_PRESENT', '90'))   # signed in and active recently
+-MATCH_KEEP = float(os.environ.get('DUSK_MATCH_KEEP', '90'))     # how long an undelivered match is kept
+-GAME_RULE = os.environ.get('DUSK_GAME_RULE', 'REGULAR')
+-RULE_TYPE = os.environ.get('DUSK_RULE_TYPE', 'DEFAULT')
+-TEAM_RULE = os.environ.get('DUSK_TEAM_RULE', 'SOLO')
++WAIT_SECONDS = float(os.environ.get('DUSK_MATCH_WAIT', '5'))   # after the minimum is reached, wait for more
++TICKET_TTL = float(os.environ.get('DUSK_TICKET_TTL', '30'))   # a search nobody polls for this long is abandoned
+ LOG = None                       # set by frontdoor: LOG(event, **details)
+ 
+ _lock = threading.RLock()
+ _room_of_ip = {}                 # client address -> room (registered by the launcher over HTTP)
+-_bots_rooms = set()              # rooms whose host asked for bots
+-_players = {}                    # player id -> {'ip', 'room', 'seen', 'search', 'match'}
+-_matches = {}                    # match id -> {'room', 'members', 'spec', 'bots', 'created', 'key', ...}
++_players = {}                    # player id -> {'ip', 'room', 'seen'}
++_tickets = {}                    # matching request id -> ticket dict
+ _next = {'pid': 2000, 'ticket': 1, 'match': 1}
++# Host panel (2026-11-13): with 'on' the server keeps everybody searching until the host presses
++# Start match in the panel (go_until = a few seconds in which _try_match may match).
++# 'all': start by itself once every connected player is searching (and the minimum is reached).
++_hold = {'on': os.environ.get('DUSK_MATCH_HOLD') == '1', 'go_until': 0.0,
++         'all': os.environ.get('DUSK_MATCH_ALL') == '1'}
++_matches = []                    # {'id', 'time', 'players'} for the panel, newest last
++_events = []                     # (time, text) for the panel, newest last
++_started = time.time()
++
++
++def _event(text):
++    _events.append((time.time(), text))
++    del _events[:-60]
+ 
+ 
+ def _log(event, **details):
+@@ -92,29 +93,22 @@
+         LOG(event, **details)
+ 
+ 
+-def register_room(ip, room, bots=False):
++def register_room(ip, room, bots=False):   # bots: sent by launcher 1.4+ front door, unused here
+     with _lock:
+         _room_of_ip[ip] = room
+-        if bots:
+-            _bots_rooms.add(room)
+         for player in _players.values():          # players already signed in from this address
+             if player['ip'] == ip:
+                 player['room'] = room
+-    _log('online_register', ip=ip, room=room[:8], bots=bool(bots))
+-
+-
+-def _is_bots(room):
+-    return BOTS_EVERYWHERE or room in _bots_rooms
++    _log('online_register', ip=ip, room=room[:8])
+ 
+ 
+ def stats():
+     with _lock:
+-        now = time.time()
+-        searching = {}
+-        for p in _players.values():
+-            if _searching(p, now):
+-                searching[p['room'][:8]] = searching.get(p['room'][:8], 0) + 1
+-        return {'players': len(_players), 'registered': len(_room_of_ip), 'waiting': searching}
++        waiting = {}
++        for t in _tickets.values():
++            if t['state'] == 'waiting':
++                waiting[t['room'][:8]] = waiting.get(t['room'][:8], 0) + 1
++        return {'players': len(_players), 'registered': len(_room_of_ip), 'waiting': waiting}
+ 
+ 
+ def _new_player(ctx):
+@@ -122,8 +116,11 @@
+     ip = ctx.get('ip', '?')
+     _next['pid'] += 1
+     pid = _next['pid']
+-    _players[pid] = {'ip': ip, 'room': _room_of_ip.get(ip) or 'ip:' + ip, 'seen': time.time(),
+-                     'search': None, 'match': None}
++    # DUSK_DEFAULT_ROOM: the room of a player whose address never registered one (a test rig that
++    # restarts the server while another PC's game keeps running).
++    _players[pid] = {'ip': ip, 'room': _room_of_ip.get(ip) or os.environ.get('DUSK_DEFAULT_ROOM') or 'ip:' + ip, 'seen': time.time(),
++                     'since': time.time(), 'last': 'CreateSession', 'searches': 0, 'matches': 0}
++    _event('Player %d connected from %s' % (pid, ip))
+     _log('online_player', pid=pid, ip=ip, room=_players[pid]['room'][:8])
+     return pid
+ 
+@@ -138,59 +135,136 @@
+         return pid, _players[pid]
+ 
+ 
+-def _searching(player, now):
+-    search = player['search']
+-    return search is not None and player['match'] is None and now - search['last'] <= SEARCH_TTL
+-
+-
+-def _room_state(room, now):
+-    present = [pid for pid, p in _players.items() if p['room'] == room and now - p['seen'] <= PRESENT_SECONDS]
+-    searching = sorted((pid for pid in present if _searching(_players[pid], now)),
+-                       key=lambda pid: _players[pid]['search']['since'])
+-    return present, searching
++def _waiting(room, now=None):
++    now = now or time.time()
++    for t in _tickets.values():   # a player who quit the game mid-search must not be matched
++        if t['state'] == 'waiting' and now - t['polled'] > TICKET_TTL:
++            t['state'] = 'expired'
++            _log('online_ticket_expired', ticket=t['id'], pid=t['pid'])
++    return sorted((t for t in _tickets.values() if t['state'] == 'waiting' and t['room'] == room),
++                  key=lambda t: t['created'])
+ 
+ 
+ def _try_match(room, now):
+-    present, searching = _room_state(room, now)
+-    bots = _is_bots(room)
+-    need = 1 if bots else MIN_PLAYERS
+-    if len(searching) < need:
++    group = _waiting(room)
++    if len(group) < MIN_PLAYERS:
+         return
+-    oldest = _players[searching[0]]['search']['since']
+-    everyone = len(searching) >= len(present)
+-    if len(searching) < MAX_PLAYERS and not everyone and now - oldest < WAIT_SECONDS:
++    if _hold['on']:
++        newest = {}
++        for pid, player in _players.items():     # N9: players of THIS room only
++            if now - player['seen'] < 60 and player['room'] == room and \
++                    (player['ip'] not in newest or pid > newest[player['ip']]):
++                newest[player['ip']] = pid
++        everyone = _hold['all'] and len(group) >= len(newest)
++        if now > _hold['go_until'] and not everyone:
++            return                      # everybody keeps searching until the host presses Start
++        _hold['go_until'] = 0.0
++    elif len(group) < MAX_PLAYERS and now - group[0]['created'] < WAIT_SECONDS:
+         return
+-    group = searching[:MAX_PLAYERS]
+-    # The PC that hosts the room (its game reaches the server over loopback) hosts the match too.
+-    group.sort(key=lambda pid: 0 if _players[pid]['ip'].startswith('127.') else 1)
++    group = group[:MAX_PLAYERS]
+     match_id = _next['match']
+     _next['match'] += 1
+-    spec = _players[group[0]]['search'].get('spec') or {}
+-    _matches[match_id] = {'room': room, 'members': [(pid, _players[pid]['ip']) for pid in group],
+-                          'spec': spec, 'bots': bots, 'created': now, 'delivered': set(),
+-                          'specs': {pid: _players[pid]['search'].get('spec') or {} for pid in group},
+-                          'key': base64.b64encode(secrets.token_bytes(32)).decode(), 'registered': None}
+-    for pid in group:
+-        _players[pid]['match'] = match_id
+-        _players[pid]['search'] = None
+-    _log('online_match', match_id=match_id, room=room[:8], players=group, host=group[0], bots=bots,
+-         present=len(present), addresses=[_players[pid]['ip'] for pid in group])
+-
+-
+-def _current_match(player, now):
+-    match = _matches.get(player['match'])
+-    if match is None or now - match['created'] > MATCH_KEEP:
+-        player['match'] = None
+-        return None
+-    return match
+-
+-
+-def _host_info(match, ctx):
+-    host_pid, host_ip = match['members'][0]
++    members = [(t['pid'], _players[t['pid']]['ip']) for t in group]
++    for t in group:
++        t.update(state='matched', match_id=match_id, members=members, matched=now)
++    _event('Match %d started with players %s' % (match_id, ', '.join(str(m[0]) for m in members)))
++    _matches.append({'id': match_id, 'time': now, 'players': [m[0] for m in members]})
++    del _matches[:-30]
++    for m in members:
++        _players[m[0]]['matches'] = _players[m[0]].get('matches', 0) + 1
++    _log('online_match', match_id=match_id, room=room[:8], players=[m[0] for m in members],
++         host=members[0][0], addresses=[m[1] for m in members])
++    _write_match_file(match_id, len(members), now)
++
++
++def _p2p_record(ip, port):
++    """The 32-byte p2p_host_info the game accepts (decoder main+0x14d4d40): u32 1, u32 24, then
++    u32 IPv4 (LE of a<<24|b<<16|c<<8|d), u16 port LE, u16 0, 16 zero bytes. Anything else is
++    rejected silently (the endless "Connecting...")."""
++    try:
++        a, b, c, d = (int(x) for x in ip.split('.'))
++    except ValueError:
++        return []
++    rec = (1).to_bytes(4, 'little') + (24).to_bytes(4, 'little')
++    rec += ((a << 24) | (b << 16) | (c << 8) | d).to_bytes(4, 'little') + port.to_bytes(2, 'little')
++    rec += bytes(18)
++    return list(rec)
++
++
++def _advertised():
++    """This PC's address for the other players. Tailscale play (tailscale_support.diff): the
++    launcher sets DUSK_HOST_IP for this server itself (its first private address), so the host
++    script's choice comes as DUSK_ADVERTISE_IP."""
++    return os.environ.get('DUSK_ADVERTISE_IP') or os.environ.get('DUSK_HOST_IP', '')
++
++
++_map_cache = {'mtime': None, 'pairs': {}}
++
++
++def _p2p_addrs():
++    """DUSK_P2P_ADDR plus, in Tailscale play, the pairs host_plus.py writes as guests' second
++    games arrive (DUSK_P2P_ADDR_FILE, lines 127.0.2.<k>=<address>)."""
++    addrs = dict(x.split('=', 1) for x in os.environ.get('DUSK_P2P_ADDR', '').split(',') if '=' in x)
++    path = os.environ.get('DUSK_P2P_ADDR_FILE')
++    if path:
++        try:
++            mtime = os.path.getmtime(path)
++            if mtime != _map_cache['mtime']:
++                with open(path, encoding='utf-8') as f:
++                    _map_cache['pairs'] = dict(line.strip().split('=', 1) for line in f if '=' in line)
++                _map_cache['mtime'] = mtime
++        except (OSError, ValueError):
++            pass
++        addrs.update(_map_cache['pairs'])
++    return addrs
++
++
++def _in_tailscale(ip):
++    """In the VPN's network: Tailscale's 100.64.0.0/10, or DUSK_VPN_NET (ZeroTier and others)."""
++    import ipaddress
++    try:
++        net = ipaddress.IPv4Network(os.environ.get('DUSK_VPN_NET', '').strip() or '100.64.0.0/10', strict=False)
++        return ipaddress.IPv4Address(ip) in net
++    except ValueError:
++        return False
++
++
++def _p2p_address(ip):
++    """(address, port) other players reach this player's game at."""
++    ports = dict(x.split('=', 1) for x in os.environ.get('DUSK_P2P_PORTS', '').split(',') if '=' in x)
++    addrs = _p2p_addrs()
++    return addrs.get(ip, ip), int(ports.get(ip, P2P_PORT or 15500))
++
++
++def _host_info(ticket, ctx):
++    host_pid, host_ip = ticket['members'][0]
++    if P2P_FORMAT == 'cross':
++        # The game's P2P layer (UDP 15500) is symmetric: it sends hellos to the address it was given
++        # and only answers that address. For a 1v1, give each player the OTHER player's address.
++        others = [m for m in ticket['members'] if m[0] != ticket['pid']] or ticket['members']
++        host_pid, host_ip = others[0]
++    if P2P_FORMAT == 'self':
++        # Experiment 2026-11-13: every player's "game server" address is its own game, so the
++        # server link needs no partner and the match is not limited to pairs.
++        host_pid, host_ip = ticket['pid'], _players[ticket['pid']]['ip']
++    # DUSK_P2P_PORTS=<ip>=<port>,...: a player at that address listens on another P2P port (two
++    # games on one PC: the second one's emulator maps 15500 to it, LICHII_PORT_MAP).
++    ports = dict(x.split('=', 1) for x in os.environ.get('DUSK_P2P_PORTS', '').split(',') if '=' in x)
++    port = int(ports.get(host_ip, P2P_PORT or 15500))
++    # DUSK_P2P_ADDR=<ip>=<address>,...: a player whose server connections come from <ip> is reached
++    # for P2P at <address> (a third game on one PC signs in through another local adapter).
++    addrs = _p2p_addrs()
++    host_ip = addrs.get(host_ip, host_ip)
+     if host_ip.startswith('127.') or host_ip == '::1':
+         host_ip = (ctx or {}).get('local') or host_ip     # the host reached its own server over loopback
+     if host_ip.startswith('127.') or host_ip == '::1':
+-        host_ip = os.environ.get('DUSK_HOST_IP') or host_ip   # ...and is asking itself: its network address
++        host_ip = _advertised() or host_ip   # ...and is asking itself: its network address
++    if P2P_FORMAT in ('record', 'cross', 'self'):
++        return _p2p_record(host_ip, port)
++    if P2P_FORMAT == 'hex':   # experiment: raw bytes from DUSK_P2P_HEX
++        f = os.environ.get('DUSK_P2P_FILE')
++        text = open(f).read().strip() if f and os.path.exists(f) else os.environ.get('DUSK_P2P_HEX', '')
++        return list(bytes.fromhex(text))
+     if P2P_FORMAT == 'pid':
+         return [host_pid]
+     if P2P_FORMAT == 'empty':
+@@ -204,142 +278,512 @@
+ 
+ def matching_ticket(value, ctx):
+     pid, player = _player(ctx)
+-    now = time.time()
+-    with _lock:
+-        match = _current_match(player, now)
+-        if match is not None and pid in match['delivered']:
+-            player['match'] = None                 # a new search after a delivered match
++    with _lock:
++        for t in _tickets.values():          # one search at a time per player
++            if t['pid'] == pid and t['state'] == 'waiting':
++                t['state'] = 'cancelled'
+         tid = _next['ticket']
+         _next['ticket'] += 1
+-        if player['match'] is None:
+-            if player['search'] is None or now - player['search']['last'] > SEARCH_TTL:
+-                player['search'] = {'since': now, 'last': now}
+-            player['search'].update(last=now, ticket=tid,
+-                                    spec=value.get('normal_matching_spec') if isinstance(value, dict) else None,
+-                                    request=value if isinstance(value, dict) else {})
+-            _try_match(player['room'], now)
+-    _log('online_ticket', ticket=tid, pid=pid, room=player['room'][:8], match=player['match'])
++        now = time.time()
++        _tickets[tid] = {'id': tid, 'pid': pid, 'room': player['room'], 'created': now, 'polled': now,
++                         'state': 'waiting'}
++    player['searches'] = player.get('searches', 0) + 1
++    _event('Player %d is searching for a match' % pid)
++    _log('online_ticket', ticket=tid, pid=pid, room=player['room'][:8])
+     return {'matching_request_id': tid, 'now_rank_point': 0}
+ 
+ 
++LONG_POLL = float(os.environ.get('DUSK_WAIT_LONGPOLL', '0'))   # seconds a WAITING answer is held back
++
++
++_poll_seq = {}                   # player id -> number of its newest WaitForMatching request
++CLIENT_TIMEOUT = float(os.environ.get('DUSK_GAME_HTTP_TIMEOUT', '120'))   # the game's timeout for one wait request
++SEARCH_ROUNDS = 4                # wait requests the game makes for one search before it gives up
++_poll_info = {}                  # player id -> {'ticket', 'rounds', 'asked'} of its current search
++
++
+ def wait_for_matching(value, ctx):
++    """Long poll. The game ends a search after 4 wait requests that brought no match: 4 WAITING
++    answers (4 s when they come at once) or 4 timeouts of its own (120 s each; measured 2026-11-13
++    11:55-12:03: requests at 0, 121, 242 and 363 s, then none). So the answer is held back and sent
++    at once when the match is made, which keeps a player searching for about 8 minutes. A request
++    the game neither answers nor repeats within its timeout is dead: the search is over then, and
++    the ticket must not stay 'waiting' (it did before, so the host started a match with players
++    whose games had already stopped searching)."""
++    pid, _ = _player(ctx)
++    tid = value.get('matching_request_id') if isinstance(value, dict) else None
++    asked = time.time()
++    with _lock:
++        seq = _poll_seq[pid] = _poll_seq.get(pid, 0) + 1
++        info = _poll_info.get(pid)
++        if info is None or info['ticket'] != tid:
++            info = _poll_info[pid] = {'ticket': tid, 'rounds': 0, 'asked': asked}
++        info['rounds'] += 1
++        info['asked'] = asked
++    end = asked + min(LONG_POLL, CLIENT_TIMEOUT + 6)
++    while True:
++        result = _wait_for_matching(value, ctx)
++        if result.pop('_release', False) or result.get('result_type') != 'WAITING_MATCHING':
++            return result
++        if _poll_seq.get(pid) != seq:
++            return result               # the game asked again (its timeout): this request is dead
++        if time.time() >= end:
++            break
++        time.sleep(0.2)
++    if LONG_POLL > CLIENT_TIMEOUT:
++        with _lock:                     # the game's timeout passed and it did not ask again
++            ticket = _tickets.get(tid)
++            if ticket is not None and ticket['pid'] == pid and ticket['state'] == 'waiting':
++                ticket.update(state='expired', ended='timeout')
++                _event('Player %d: the search ended by itself (a search lasts about 8 minutes)' % pid)
++    return result
++
++
++def _search_left(pid, now):
++    """Seconds until this player's game ends its search by itself, or None."""
++    info = _poll_info.get(pid)
++    if info is None or LONG_POLL <= CLIENT_TIMEOUT:
++        return None
++    round_time = CLIENT_TIMEOUT + 1
++    return max(0.0, (SEARCH_ROUNDS - info['rounds']) * round_time + round_time - (now - info['asked']))
++
++
++def _wait_for_matching(value, ctx):
+     pid, player = _player(ctx)
++    tid = value.get('matching_request_id') if isinstance(value, dict) else None
+     now = time.time()
+     with _lock:
+-        if player['match'] is None and player['search'] is not None:
+-            player['search']['last'] = now
+-            _try_match(player['room'], now)
+-        match = _current_match(player, now)
+-        if match is None:
+-            _, searching = _room_state(player['room'], now)
+-            return {'result_type': 'WAITING_MATCHING',
+-                    'body_waiting_matching': {'matchable_player_num': len(searching)}}
+-        match['delivered'].add(pid)
+-        match_id = player['match']
++        ticket = _tickets.get(tid)
++        if ticket is None:   # a ticket we never issued: use this player's latest recent one
++            ticket = max((t for t in _tickets.values() if t['pid'] == pid and (t['state'] == 'waiting' or (
++                t['state'] == 'matched' and now - t['matched'] < 60))), key=lambda t: t['id'], default=None)
++        if ticket is not None and ticket['state'] == 'cancelled' and ticket.get('release') \
++                and ticket['pid'] == pid:
++            # The host stopped the searches: answer at once, the game then ends its search
++            # after its 4 quick rounds instead of sitting on "searching".
++            return {'result_type': 'WAITING_MATCHING', 'body_waiting_matching': {'matchable_player_num': 0},
++                    '_release': True}
++        if ticket is not None and ticket['state'] in ('waiting', 'expired') and ticket['pid'] == pid:
++            ticket.update(state='waiting', polled=now)   # still searching (revives a slow poller)
++            ticket.pop('ended', None)
++        if ticket is not None and ticket['state'] == 'waiting':
++            _try_match(ticket['room'], now)
++        if ticket is None or ticket['state'] != 'matched':
++            # DUSK_MATCHABLE_NUM: test value for the count the game is told (default: the real count)
++            num = int(os.environ.get('DUSK_MATCHABLE_NUM') or len(_waiting(player['room'])))
++            return {'result_type': 'WAITING_MATCHING', 'body_waiting_matching': {'matchable_player_num': num}}
+         result = {'result_type': 'MATCHED',
+-                  'body_matched': {'matching_ticket_type': 'NORMAL_MATCH', 'p2p_host_info': _host_info(match, ctx),
+-                                   'match_id': match_id, 'normal_matching_result': {},
++                  'body_matched': {'matching_ticket_type': 'NORMAL_MATCH', 'p2p_host_info': _host_info(ticket, ctx),
++                                   'match_id': ticket['match_id'], 'normal_matching_result': {},
+                                    'event_matching_result': {'event_match_type': 0}}}
+-    _log('online_matched_reply', pid=pid, match_id=match_id, p2p_host_info=result['body_matched']['p2p_host_info'])
++    _log('online_matched_reply', pid=pid, ticket=ticket['id'], match_id=ticket['match_id'],
++         p2p_host_info=result['body_matched']['p2p_host_info'])
+     return result
+ 
+ 
+ def cancel_matching(value, ctx):
+     pid, player = _player(ctx)
+-    now = time.time()
+-    with _lock:
+-        if player['search'] is not None:
+-            _log('online_cancel', pid=pid)
+-        player['search'] = None
+-        _, searching = _room_state(player['room'], now)
+-        return {'matchable_player_num': len(searching)}
++    with _lock:
++        for t in _tickets.values():
++            if t['pid'] == pid and t['state'] == 'waiting':
++                t['state'] = 'cancelled'
++                _event('Player %d stopped searching' % pid)
++        return {'matchable_player_num': len(_waiting(player['room']))}
+ 
+ 
+ def matching_player_num(value, ctx):
+     _, player = _player(ctx)
+     with _lock:
+-        _, searching = _room_state(player['room'], time.time())
+-        return {'matching_player_num': len(searching)}
+-
+-
+-def _signature(pid):
+-    doc = base64.b64encode(json.dumps({'player_id': pid}).encode()).decode()
+-    return {'player_id_document': doc, 'signature_base64': base64.b64encode(b'\0' * 64).decode()}
+-
+-
+-def register_room_reply(value, ctx):
+-    """The match host registers the room the others join (guess: room id = match id)."""
+-    pid, player = _player(ctx)
+-    with _lock:
+-        match = _current_match(player, time.time())
+-        if match is None:
+-            return {}
+-        match['registered'] = pid
+-        return {'room_id': player['match'], 'public_key_base64': match['key']}
+-
+-
+-def wait_for_assigning_room(value, ctx):
+-    pid, player = _player(ctx)
+-    with _lock:
+-        match = _current_match(player, time.time())
+-        if match is None:
+-            return {'has_result': False}
+-        spec = match['spec'] or {}
+-        infos = [{'player_id': member, 'display_user_id': 'LOCAL-%d' % member,
+-                  'main_role_id': match['specs'].get(member, {}).get('role_id', -1), 'received_role_id': 0,
+-                  'received_role_player_id_1': 0, 'received_role_player_id_2': 0, 'duo_team': ''}
+-                 for member, _ in match['members']]
+-        return {'has_result': True,
+-                'body': {'game_mode': spec.get('game_mode') or 'REGULAR_MATCH',
+-                         'assigning_room': {
+-                             'match_id': player['match'],
+-                             'room_spec': {'game_mode': spec.get('game_mode') or 'REGULAR_MATCH',
+-                                           'game_rule': GAME_RULE, 'rule_type': RULE_TYPE, 'team_rule': TEAM_RULE,
+-                                           'regulation_version': 0, 'executable_version': 26192},
+-                             'is_allowed_bot': match['bots'],
+-                             'player_infos': infos}}}
+-
+-
+-def delete_room(value, ctx):
+-    pid, player = _player(ctx)
+-    return {'player_id_with_signature': _signature(pid)}
++        return {'matching_player_num': len(_waiting(player['room']))}
+ 
+ 
+ ONLINE_HANDLERS = {'ResponseMatchingTicketParams': matching_ticket,
+                    'ResponseWaitForMatchingTicketResultParams': wait_for_matching,
+                    'ResponseCancelMatchingTicketParams': cancel_matching,
+-                   'ResponseGetMatchingPlayerNumParams': matching_player_num,
+-                   'ResponseRegisterRoomParams': register_room_reply,
+-                   'ResponseWaitForAssigningRoomParams': wait_for_assigning_room,
+-                   'ResponseDeleteRoomParams': delete_room}
+-# Replies logged in full: everything after a match is still being learned from the game.
+-TRACE = ('Matching', 'Room', 'Bot', 'Match', 'Polling', 'CheckAlive', 'Visit')
++                   'ResponseGetMatchingPlayerNumParams': matching_player_num}
+ 
+ 
+ def reply(request_type, value, ctx=None):
+     """Return (response_json_bytes, extra_headers) or None if unsupported."""
+     if not request_type.startswith('Request'): return None
+     name = 'Response' + request_type[len('Request'):]
+-    if ONLINE and not any(word in name for word in TRACE) and name not in SCHEMAS:
+-        _log('online_unknown_request', type=request_type)
+     if name not in SCHEMAS: return None
+     if ONLINE:
++        found = re.search(r'session-id=local(\d+)', (ctx or {}).get('cookie') or '')
++        if found and int(found.group(1)) in _players:
++            _players[int(found.group(1))].update(seen=time.time(), last=request_type[len('Request'):])
+         if name == 'ResponseCreateSessionParams':
+             with _lock:
+                 pid = _new_player(ctx)
++            doc = base64.b64encode(json.dumps({'player_id': pid}).encode()).decode()
+             payload = build(name, value)
+             payload.update(player_id=pid, display_user_id='LOCAL-%d' % pid, user_id='local-%d' % pid,
+-                           player_id_with_signature=_signature(pid))
++                           player_id_with_signature={'player_id_document': doc,
++                                                     'signature_base64': base64.b64encode(b'\0' * 64).decode()})
+             return (json.dumps({'type': name, 'value': payload}).encode(),
+                     [('Set-Cookie', 'session-id=local%d; Path=/' % pid)])
+-        payload = build(name, value)
+         if name in ONLINE_HANDLERS:
++            payload = build(name, value)
+             payload.update(ONLINE_HANDLERS[name](value, ctx))
+-        else:
+-            _player(ctx)   # any request keeps the player "present" in its room
+-        if any(word in name for word in TRACE) and name != 'ResponseWaitForMatchingTicketResultParams':
+-            _log('online_reply', type=name, value=json.dumps(payload)[:2000])
+-        return json.dumps({'type': name, 'value': payload}).encode(), []
++            return json.dumps({'type': name, 'value': payload}).encode(), []
+     body = json.dumps({'type': name, 'value': build(name, value)}).encode()
+     headers = [('Set-Cookie', 'session-id=local%d; Path=/' % PLAYER_ID)] if name == 'ResponseCreateSessionParams' else []
+     return body, headers
++
++
++# --- host panel: a local web page that shows who is connected and starts the match -------------
++# DUSK_PANEL_PORT=<port> turns it on (lan_fix_host.py sets 18450); loopback only. The page is
++# DUSK_PANEL_HTML (launcher\lan_fix\panel.html). Game details come from the emulator's LAN assist
++# (%APPDATA%\eden\log\dusk_lan_status.json, written once a second by core/dusk_lan.cpp).
++PANEL_PORT = int(os.environ.get('DUSK_PANEL_PORT', '0') or 0)
++PANEL_HTML = os.environ.get('DUSK_PANEL_HTML', '')
++STATUS_FILE = os.environ.get('DUSK_STATUS_FILE') or os.path.join(
++    os.environ.get('APPDATA', ''), 'eden', 'log', 'dusk_lan_status.json')
++# v3.9.8 F5: the lobby size of the newest match, for the game on this PC (core/dusk_lan.cpp
++# LobbyShare reads it and passes it to the other games), so every game numbers the players only
++# once all of them are listed. One line: "match <id> players <n> time <unix>".
++MATCH_FILE = os.environ.get('DUSK_MATCH_FILE') or os.path.join(os.path.dirname(STATUS_FILE),
++                                                                'dusk_lan_match.txt')
++
++
++def _write_match_file(match_id, players, now):
++    try:
++        os.makedirs(os.path.dirname(MATCH_FILE), exist_ok=True)
++        tmp = MATCH_FILE + '.tmp'
++        with open(tmp, 'w') as f:
++            f.write('match %d players %d time %d\n' % (match_id, players, int(now)))
++        os.replace(tmp, MATCH_FILE)
++    except OSError as e:
++        _log('online_match_file_failed', path=MATCH_FILE, error=str(e))
++
++
++# v4.43 HOSTTEXT: the host's text for the players' screens. The game on this PC (core/dusk_lan.cpp
++# HostText) reads dusk_lan_say.txt once a second, shows the text and sends it to the other games.
++# Same channel as dusk_lan_match.txt: a small file, written atomically, in the two places the game looks
++# (next to the status file, and in this lan_fix folder). Format: "say <seq> <target> <unix time>" and, on
++# the next line, the text in UTF-8. target 0 = every player, else a player number (1..8).
++SAY_MAX = 60
++_say = {'at': 0.0, 'seq': 0}
++
++
++def _say_paths():
++    paths = [os.path.join(os.path.dirname(STATUS_FILE), 'dusk_lan_say.txt'),
++             os.path.join(os.path.dirname(MATCH_FILE), 'dusk_lan_say.txt')]
++    return [p for i, p in enumerate(paths) if p not in paths[:i]]
++
++
++def _clean_say(text):
++    """ASCII 0x20..0x7E only (the game's banner font is only known for those), no '<' or '>' (the UI reads
++    <?tag?> as markup), trimmed, at most SAY_MAX characters."""
++    out = ''.join(c if ' ' <= c <= '~' else ('' if c in '\r\n\t' else '?') for c in str(text))
++    out = ''.join(c for c in out if c not in '<>').strip()
++    return out[:SAY_MAX]
++
++
++def _write_say_file(seq, target, text):
++    ok = False
++    for path in _say_paths():
++        try:
++            os.makedirs(os.path.dirname(path), exist_ok=True)
++            tmp = path + '.tmp'
++            with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
++                f.write('say %d %d %d\n%s\n' % (seq, target, int(time.time()), text))
++            os.replace(tmp, path)
++            ok = True
++        except OSError as e:
++            _log('online_say_file_failed', path=path, error=str(e))
++    return ok
++
++
++_pings = {}                      # ip -> (time, ms or None)
++_cpu = {'at': time.time(), 'used': time.process_time(), 'percent': 0.0}
++_host_game = {'fps': None, 'at': 0.0}        # the host's own game, from its debug server
++
++
++def _game_fps():
++    """Frame rate of the game on this PC (emulator debug server, EDEN_NX2_DEBUG_SERVER, loopback)."""
++    import socket
++    try:
++        with socket.create_connection(('127.0.0.1', int(os.environ.get('DUSK_DEBUG_PORT', '6545'))), timeout=0.5) as sock:
++            sock.settimeout(1.5)
++            sock.sendall(b'{"id": 1, "method": "status", "params": {}}\n')
++            data = b''
++            while b'\n' not in data:
++                chunk = sock.recv(65536)
++                if not chunk:
++                    break
++                data += chunk
++        result = json.loads(data.split(b'\n')[0]).get('result') or {}
++        return round(float(result.get('fps', 0)), 1)
++    except (OSError, ValueError):
++        return None
++
++PHASE_NAMES = {0: 'Loading the match', 1: 'Loading the match', 2: 'Loading the match', 3: 'Loading the match',
++               4: 'Match is starting', 5: 'Match is starting', 6: 'In battle', 7: 'Phase ending',
++               8: 'Phase ending', 9: 'Phase result', 10: 'Phase result', 11: 'Phase result',
++               14: 'Match result', 18: 'Next round', 21: 'Next round', 22: 'Next round',
++               26: 'Choosing a start point', 29: 'Match result', 36: 'Outcome screen'}
++
++
++def _icmp_ping(ip, timeout_ms=800):
++    """Round trip to ip in ms through Windows' IcmpSendEcho (no admin rights, no child process)."""
++    try:
++        import ctypes, socket, struct
++        icmp = ctypes.windll.iphlpapi
++        icmp.IcmpCreateFile.restype = ctypes.c_void_p
++        handle = icmp.IcmpCreateFile()
++        if not handle or handle == ctypes.c_void_p(-1).value:
++            return None
++        try:
++            address = struct.unpack('<I', socket.inet_aton(ip))[0]
++            data = b'duskpanel'
++            reply = ctypes.create_string_buffer(64 + len(data))
++            icmp.IcmpSendEcho.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint16,
++                                          ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
++            count = icmp.IcmpSendEcho(handle, address, data, len(data), None, reply, len(reply), timeout_ms)
++            if count == 0:
++                return None
++            status, rtt = struct.unpack_from('<II', reply.raw, 4)
++            return rtt if status == 0 else None
++        finally:
++            icmp.IcmpCloseHandle.argtypes = [ctypes.c_void_p]
++            icmp.IcmpCloseHandle(handle)
++    except Exception:
++        return None
++
++
++def _ping_loop():
++    while True:
++        with _lock:
++            ips = {p['ip'] for p in _players.values() if time.time() - p['seen'] < 600}
++        for ip in ips:
++            target = _p2p_address(ip)[0]         # N8: a relayed second game (127.0.1.d) is at <LAN>.d
++            if target.startswith('127.') or target in ('::1', '?'):
++                continue
++            _pings[ip] = (time.time(), _icmp_ping(target))
++        _host_game.update(fps=_game_fps(), at=time.time())
++        now = time.time()
++        used = time.process_time()
++        if now - _cpu['at'] >= 1:
++            _cpu.update(percent=100.0 * (used - _cpu['used']) / (now - _cpu['at']), at=now, used=used)
++        time.sleep(3)
++
++
++def _game_status():
++    try:
++        if time.time() - os.path.getmtime(STATUS_FILE) > 5:
++            return None                              # the game on this PC is not running
++        return json.loads(open(STATUS_FILE, encoding='utf-8').read())
++    except (OSError, ValueError):
++        return None
++
++
++def panel_state():
++    now = time.time()
++    game = _game_status()
++    host_ip = _advertised()
++    tailscale = os.environ.get('DUSK_TAILSCALE') == '1'
++    with _lock:
++        newest = {}
++        for pid, player in _players.items():        # one row per address: its newest sign-in
++            if player['ip'] not in newest or pid > newest[player['ip']]:
++                newest[player['ip']] = pid
++        rows = []
++        used = set()
++        for ip, pid in sorted(newest.items(), key=lambda item: item[1]):
++            player = _players[pid]
++            tickets = [t for t in _tickets.values() if t['pid'] == pid]
++            ticket = max(tickets, key=lambda t: t['id']) if tickets else None
++            # the host's game uses loopback; N8: 127.0.1.<d> is a guest PC's second game (host_plus relay)
++            local = ip.startswith('127.0.0.') or ip == '::1'
++            idle = now - player['seen']
++            status, detail, kind = 'In the menus', '', 'menu'
++            if ticket and ticket['state'] == 'waiting':
++                status, kind = 'Searching for a match', 'search'
++                detail = 'waiting %d s' % (now - ticket['created'])
++                left = _search_left(pid, now)
++                if left is not None:
++                    detail += ', search ends in %d:%02d' % (left // 60, left % 60)
++            elif ticket and ticket['state'] == 'expired' and ticket.get('ended') == 'timeout':
++                status, kind = 'Search ended', 'ended'
++                detail = 'it ran out after 8 minutes: start matchmaking again in the game'
++            elif ticket and ticket['state'] == 'matched' and now - ticket['matched'] < 3600:
++                status, kind = 'In a match', 'match'
++                detail = 'match %d' % ticket['match_id']
++            row = {'pid': pid, 'ip': ip, 'local': local, 'seen_ago': round(idle, 1),
++                   'connected_for': round(now - player.get('since', now)), 'last': player.get('last', ''),
++                   'searches': player.get('searches', 0), 'matches': player.get('matches', 0)}
++            ping = _pings.get(ip)
++            row['ping_ms'] = 0 if local else (ping[1] if ping and now - ping[0] < 10 else None)
++            row['ping_kind'] = 'this PC' if local else 'network'
++            if game and game.get('in_session'):
++                if local:
++                    row['phase'] = game.get('phase')
++                    row['clock_left'] = game.get('clock_left')
++                    row['player_no'] = game.get('player_no')
++                    if game.get('join_state') == 8:
++                        status, kind = PHASE_NAMES.get(game.get('phase'), 'In a match'), 'match'
++                    else:
++                        status, kind = 'Joining the match', 'match'
++                else:
++                    # what this player's emulator tells the host's over the side channel
++                    address, port = _p2p_address(ip)
++                    peers = game.get('peers') or []
++                    free = [x for x in peers if id(x) not in used]       # each report belongs to one row
++                    peer = (next((x for x in free if x.get('ip') == address and x.get('port') == port), None)
++                            or next((x for x in free if x.get('ip') == address), None)
++                            or (free[0] if free else None))
++                    if peer:
++                        used.add(id(peer))
++                        row['phase'] = peer.get('phase')
++                        row['clock_left'] = peer.get('clock')
++                        row['player_no'] = peer.get('no')
++                        status, kind = PHASE_NAMES.get(peer.get('phase'), 'In a match'), 'match'
++                        if peer.get('ping_ms', -1) >= 0:
++                            row['ping_ms'], row['ping_kind'] = round(peer['ping_ms']), 'game to game'
++                        row['timer_gap'] = peer.get('timer_gap')
++                        # 'direct': the host's game talks straight to this player's own address;
++                        # anything else went through another address (a relay or a VPN hop)
++                        row['route'] = 'direct' if peer.get('ip') == address else 'via ' + str(peer.get('ip'))
++                        row['move_delay'] = peer.get('move_delay')
++            elif kind == 'match' and (game is None or not game.get('in_session')) and ticket \
++                    and now - ticket['matched'] > 60 and local:
++                status, detail, kind = 'In the menus', '', 'menu'      # the match is over on this PC
++            if idle > 180 and kind != 'match':
++                status, kind = 'Not responding', 'gone'
++            if ticket and ticket['state'] == 'waiting':
++                row['search_left'] = _search_left(pid, now)
++            if tailscale and not local and not _in_tailscale(_p2p_address(ip)[0]):
++                # joined with a home address: no path to the players outside the home
++                detail = (detail + '; ' if detail else '') + \
++                    'NOT on %s (%s): cannot play with the remote players' % (
++                        os.environ.get('DUSK_VPN_NAME', '').strip() or 'Tailscale', ip)
++            row.update(status=status, detail=detail, kind=kind)
++            rows.append(row)
++        waiting = sum(1 for t in _tickets.values() if t['state'] == 'waiting' and now - t['polled'] <= TICKET_TTL)
++        return {'time': now,
++                'server': {'uptime': round(now - _started), 'host_ip': host_ip, 'tailscale': tailscale,
++                           'vpn_name': os.environ.get('DUSK_VPN_NAME', '').strip() or 'Tailscale',
++                           'cpu_percent': round(_cpu['percent'], 1),
++                           'hold': _hold['on'], 'all': _hold['all'], 'starting': now <= _hold['go_until'],
++                           'game_fps': _host_game['fps'] if now - _host_game['at'] < 8 else None,
++                           'matches_played': _next['match'] - 1,
++                           'clock_stepped': (game or {}).get('clock_stepped'),
++                           'min_players': MIN_PLAYERS, 'max_players': MAX_PLAYERS, 'waiting': waiting,
++                           'can_start': waiting >= MIN_PLAYERS, 'game_running': game is not None},
++                'players': rows,
++                'matches': [{'id': m['id'], 'time': m['time'], 'players': m['players'],
++                             'cancelled': bool(m.get('cancelled'))} for m in _matches[-8:]],
++                'events': [{'time': t, 'text': text} for t, text in _events[-25:]]}
++
++
++def _panel_server():
++    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++    class Handler(BaseHTTPRequestHandler):
++        def log_message(self, *args):
++            pass
++
++        def _send(self, code, body, kind='application/json'):
++            data = body if isinstance(body, bytes) else json.dumps(body).encode()
++            self.send_response(code)
++            self.send_header('Content-Type', kind)
++            self.send_header('Content-Length', str(len(data)))
++            self.send_header('Cache-Control', 'no-store')
++            self.end_headers()
++            self.wfile.write(data)
++
++        def do_GET(self):
++            if self.path.startswith('/api/state'):
++                return self._send(200, panel_state())
++            if self.path in ('/', '/index.html'):
++                try:
++                    return self._send(200, open(PANEL_HTML, 'rb').read(), 'text/html; charset=utf-8')
++                except OSError:
++                    return self._send(500, b'panel.html not found (DUSK_PANEL_HTML)', 'text/plain')
++            self._send(404, {'error': 'not found'})
++
++        def do_POST(self):
++            global MIN_PLAYERS
++            length = int(self.headers.get('Content-Length') or 0)
++            try:
++                body = json.loads(self.rfile.read(length) or b'{}')
++            except ValueError:
++                body = {}
++            if self.path == '/api/start':
++                with _lock:
++                    _hold['go_until'] = time.time() + 8
++                _event('Host pressed Start match')
++                return self._send(200, {'ok': True})
++            if self.path == '/api/cancel':
++                # Cancel match: the server forgets the running match (its players count as "in the
++                # menus" again and can search). With {"searches": true}: also end every search, so
++                # all games leave "searching". Games inside a battle are not pulled out of it.
++                with _lock:
++                    _hold['go_until'] = 0.0
++                    cancelled, stopped = set(), 0
++                    for t in _tickets.values():
++                        if t['state'] == 'matched':
++                            t['state'] = 'cancelled'
++                            cancelled.add(t['match_id'])
++                        elif body.get('searches') and t['state'] in ('waiting', 'expired'):
++                            t.update(state='cancelled', release=True)
++                            stopped += 1
++                    for m in _matches:
++                        if m['id'] in cancelled:
++                            m['cancelled'] = True
++                    if cancelled:
++                        _event('Host cancelled match %s' % ', '.join(str(x) for x in sorted(cancelled)))
++                    if body.get('searches'):
++                        _event('Host stopped all searches (%d)' % stopped)
++                    if not cancelled and not body.get('searches'):
++                        _event('Host pressed Cancel match: no match was running')
++                return self._send(200, {'ok': True, 'cancelled': sorted(cancelled), 'stopped': stopped})
++            if self.path == '/api/say':
++                # v4.43 HOSTTEXT: {"text": "...", "target": 0 | player number}
++                text = _clean_say(body.get('text', ''))
++                try:
++                    target = int(body.get('target') or 0)
++                except (TypeError, ValueError):
++                    target = 0
++                if not text:
++                    return self._send(400, {'ok': False, 'error': 'empty text'})
++                if not 0 <= target <= 8:
++                    return self._send(400, {'ok': False, 'error': 'bad player number'})
++                with _lock:
++                    now = time.time()
++                    if now - _say['at'] < 3:
++                        return self._send(429, {'ok': False, 'error': 'wait 3 seconds between messages'})
++                    _say['at'] = now
++                    seq = int(now * 1000) & 0x7FFFFFFF or 1     # a restart never repeats a number
++                    if seq <= _say['seq']:
++                        seq = _say['seq'] + 1
++                    _say['seq'] = seq
++                ok = _write_say_file(seq, target, text)
++                _event('Host message %s to %s: %s' % ('sent' if ok else 'NOT written',
++                                                      'everyone' if target == 0 else 'player %d' % target, text))
++                return self._send(200 if ok else 500, {'ok': ok, 'seq': seq, 'text': text})
++            if self.path == '/api/settings':
++                with _lock:
++                    if 'all' in body:
++                        _hold['all'] = bool(body['all'])
++                        _event('Start when everyone is searching: ' + ('on' if _hold['all'] else 'off'))
++                    if 'hold' in body:
++                        _hold['on'] = bool(body['hold'])
++                        _event('Start mode: ' + ('host presses Start' if _hold['on'] else 'automatic'))
++                    if 'min_players' in body:
++                        MIN_PLAYERS = max(2, min(MAX_PLAYERS, int(body['min_players'])))
++                        _event('Minimum players set to %d' % MIN_PLAYERS)
++                return self._send(200, {'ok': True})
++            self._send(404, {'error': 'not found'})
++
++    try:
++        server = ThreadingHTTPServer(('127.0.0.1', PANEL_PORT), Handler)
++    except OSError:
++        return                                        # already running in this or another process
++    threading.Thread(target=_ping_loop, daemon=True).start()
++    server.serve_forever()
++
++
++if ONLINE and PANEL_PORT:
++    threading.Thread(target=_panel_server, daemon=True).start()

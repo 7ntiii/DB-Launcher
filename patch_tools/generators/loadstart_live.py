@@ -1,0 +1,60 @@
+"""loadstart_gen.py: LOADSTART, second candidate for the final-load crash. Static generator,
+Gen(dry=True): cave_registry.md is NOT written (the lead adds the printed rows). Writes loadstart_live.py.
+python loadstart_gen.py [--dry]      (from diag/net)
+Cave records: orig "00000000". FAR records (0xC500000..0xC50FFFF) must be built in as
+BuiltinPatchRecord{off, NAME, {}, true} (see cave_lib.cpp_rows). Apply caves before hooks."""
+
+LOADSTART_CAVE = [  # FAR cave records
+    (0xC5041F8, "00000000", "14019F9A", True),
+    (0xC5041FC, "00000000", "940000B4", True),
+    (0xC504200, "00000000", "1F03166B", True),
+    (0xC504204, "00000000", "4A000054", True),
+    (0xC504208, "00000000", "9C020239", True),
+    (0xC50420C, "00000000", "B0D7FBB0", True),
+    (0xC504210, "00000000", "10323B91", True),
+    (0xC504214, "00000000", "00021FD6", True),
+    (0x3F7A1F0, "00000000", "502C04D0", True),
+    (0x3F7A1F4, "00000000", "10E20791", True),
+    (0x3F7A1F8, "00000000", "00021FD6", True),
+    (0xC504220, "00000000", "14019F9A", True),
+    (0xC504224, "00000000", "940000B4", True),
+    (0xC504228, "00000000", "1F03166B", True),
+    (0xC50422C, "00000000", "4A000054", True),
+    (0xC504230, "00000000", "9C020239", True),
+    (0xC504234, "00000000", "B0D7FBD0", True),
+    (0xC504238, "00000000", "10B20191", True),
+    (0xC50423C, "00000000", "00021FD6", True),
+    (0x3F7A4E4, "00000000", "502C04D0", True),
+    (0x3F7A4E8, "00000000", "10820891", True),
+    (0x3F7A4EC, "00000000", "00021FD6", True),
+    (0xC504248, "00000000", "14019F9A", True),
+    (0xC50424C, "00000000", "940000B4", True),
+    (0xC504250, "00000000", "1F03166B", True),
+    (0xC504254, "00000000", "4A000054", True),
+    (0xC504258, "00000000", "9C020239", True),
+    (0xC50425C, "00000000", "B0D7FBD0", True),
+    (0xC504260, "00000000", "10320891", True),
+    (0xC504264, "00000000", "00021FD6", True),
+    (0x3F7AB2C, "00000000", "502C04D0", True),
+    (0x3F7AB30, "00000000", "10220991", True),
+    (0x3F7AB34, "00000000", "00021FD6", True),
+    (0xC504270, "00000000", "14019F9A", True),
+    (0xC504274, "00000000", "940000B4", True),
+    (0xC504278, "00000000", "1F03166B", True),
+    (0xC50427C, "00000000", "4A000054", True),
+    (0xC504280, "00000000", "9C020239", True),
+    (0xC504284, "00000000", "B0D7FBD0", True),
+    (0xC504288, "00000000", "10B20E91", True),
+    (0xC50428C, "00000000", "00021FD6", True),
+    (0x3F7D98C, "00000000", "302C04F0", True),
+    (0x3F7D990, "00000000", "10C20991", True),
+    (0x3F7D994, "00000000", "00021FD6", True),
+]
+LOADSTART = [
+    (0x3FF9EC8, "14019F9A", "CA00FE17", True),
+    (0x3FFA068, "14019F9A", "1F01FE17", True),
+    (0x3FFA208, "14019F9A", "4902FE17", True),
+    (0x3FFA3A8, "14019F9A", "790DFE17", True),
+]
+
+ORDER = [LOADSTART_CAVE, LOADSTART]

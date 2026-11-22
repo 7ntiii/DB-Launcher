@@ -1,0 +1,116 @@
+"""partner5b_gen.py (helper 2, 2026-11-17): partner5_gen.py with the second review's two changes
+(deep_audit_F_fixes.md 5): P1 after the handle lookup an ENEMY chr (vtable main+0x572B108) goes to the
+stock answer (its +0x1D0 is not player data; saves a resolve + 3 MATCH calls per enemy per frame); P2 the
+three Eye / variable-list hooks (0x11902DC, 0x11935C8, 0x1198D88) are in group PARTNER5_EYE, NOT in the
+ORDER. Writes partner5b_live.py. Same cave range as PARTNER5 (registry row partner5_gen/PARTNER5); bake
+partner5b_live.py INSTEAD OF partner5_live.py, never both.
+
+Original header: late class-B pairing at every other class-B list test (static generator, helper 4).
+Reads nso/*.bin, patch_manager.cpp and every *_live.py through cave_lib. Writes partner5_live.py.
+python partner5_gen.py [--dry]      (from diag/net; --dry = check and print only, write nothing)
+Notes: partner5_notes.md. Generalises LOVE5 (love5_gen.py, 0x118EA34) to the six other callers of the list test
+0x119B2A0 (deep_audit_A 4b).
+
+REGISTRY: allocated with Gen(dry=True) (task rule: new files only); the lead adds the row when baking:
+  partner5_gen | PARTNER5 | <printed range> | late class-B pairing at the other list tests (LAN)
+Cave records: orig "00000000". FAR records (0xC500000..0xC50FFFF) must be built in as
+BuiltinPatchRecord{off, NAME, {}, true} (see cave_lib.cpp_rows). Apply caves before hooks."""
+
+PARTNER5_CAVE = [  # FAR cave records
+    (0xC5031D0, "00000000", "FD7BBBA9", True),
+    (0xC5031D4, "00000000", "FD030091", True),
+    (0xC5031D8, "00000000", "F35301A9", True),
+    (0xC5031DC, "00000000", "F55B02A9", True),
+    (0xC5031E0, "00000000", "F76303A9", True),
+    (0xC5031E4, "00000000", "F30300AA", True),
+    (0xC5031E8, "00000000", "F40301AA", True),
+    (0xC5031EC, "00000000", "F803022A", True),
+    (0xC5031F0, "00000000", "D064FA90", True),
+    (0xC5031F4, "00000000", "10820A91", True),
+    (0xC5031F8, "00000000", "00023FD6", True),
+    (0xC5031FC, "00000000", "A0080037", True),
+    (0xC503200, "00000000", "C8B1FCB0", True),
+    (0xC503204, "00000000", "080547F9", True),
+    (0xC503208, "00000000", "280800B4", True),
+    (0xC50320C, "00000000", "096952B9", True),
+    (0xC503210, "00000000", "3F190071", True),
+    (0xC503214, "00000000", "C1070054", True),
+    (0xC503218, "00000000", "750240F9", True),
+    (0xC50321C, "00000000", "950700B4", True),
+    (0xC503220, "00000000", "A90240F9", True),
+    (0xC503224, "00000000", "AA8FFCB0", True),
+    (0xC503228, "00000000", "4A213A91", True),
+    (0xC50322C, "00000000", "3F010AEB", True),
+    (0xC503230, "00000000", "E1060054", True),
+    (0xC503234, "00000000", "A92E40F9", True),
+    (0xC503238, "00000000", "A90600B5", True),
+    (0xC50323C, "00000000", "A95A40F9", True),
+    (0xC503240, "00000000", "3F2100F1", True),
+    (0xC503244, "00000000", "42060054", True),
+    (0xC503248, "00000000", "C8B1FCB0", True),
+    (0xC50324C, "00000000", "00C546F9", True),
+    (0xC503250, "00000000", "E00500B4", True),
+    (0xC503254, "00000000", "89024079", True),
+    (0xC503258, "00000000", "E94300B9", True),
+    (0xC50325C, "00000000", "E1030191", True),
+    (0xC503260, "00000000", "3097FA90", True),
+    (0xC503264, "00000000", "10A22091", True),
+    (0xC503268, "00000000", "00023FD6", True),
+    (0xC50326C, "00000000", "000500B4", True),
+    (0xC503270, "00000000", "090040F9", True),
+    (0xC503274, "00000000", "4A91FC90", True),
+    (0xC503278, "00000000", "4A210491", True),
+    (0xC50327C, "00000000", "3F010AEB", True),
+    (0xC503280, "00000000", "60040054", True),
+    (0xC503284, "00000000", "091040F9", True),
+    (0xC503288, "00000000", "290400B4", True),
+    (0xC50328C, "00000000", "29E940F9", True),
+    (0xC503290, "00000000", "E90300B4", True),
+    (0xC503294, "00000000", "36D140B9", True),
+    (0xC503298, "00000000", "DF920171", True),
+    (0xC50329C, "00000000", "82030054", True),
+    (0xC5032A0, "00000000", "49018052", True),
+    (0xC5032A4, "00000000", "D67E091B", True),
+    (0xC5032A8, "00000000", "17008052", True),
+    (0xC5032AC, "00000000", "C902170B", True),
+    (0xC5032B0, "00000000", "E94700B9", True),
+    (0xC5032B4, "00000000", "E00315AA", True),
+    (0xC5032B8, "00000000", "E1130191", True),
+    (0xC5032BC, "00000000", "B064FA90", True),
+    (0xC5032C0, "00000000", "10022791", True),
+    (0xC5032C4, "00000000", "00023FD6", True),
+    (0xC5032C8, "00000000", "A0000037", True),
+    (0xC5032CC, "00000000", "F7060011", True),
+    (0xC5032D0, "00000000", "FF0E0071", True),
+    (0xC5032D4, "00000000", "C3FEFF54", True),
+    (0xC5032D8, "00000000", "0D000014", True),
+    (0xC5032DC, "00000000", "E00315AA", True),
+    (0xC5032E0, "00000000", "E1130191", True),
+    (0xC5032E4, "00000000", "B064FA90", True),
+    (0xC5032E8, "00000000", "10023291", True),
+    (0xC5032EC, "00000000", "00023FD6", True),
+    (0xC5032F0, "00000000", "E00313AA", True),
+    (0xC5032F4, "00000000", "E10314AA", True),
+    (0xC5032F8, "00000000", "E203182A", True),
+    (0xC5032FC, "00000000", "D064FA90", True),
+    (0xC503300, "00000000", "10820A91", True),
+    (0xC503304, "00000000", "00023FD6", True),
+    (0xC503308, "00000000", "02000014", True),
+    (0xC50330C, "00000000", "00008052", True),
+    (0xC503310, "00000000", "F76343A9", True),
+    (0xC503314, "00000000", "F55B42A9", True),
+    (0xC503318, "00000000", "F35341A9", True),
+    (0xC50331C, "00000000", "FD7BC5A8", True),
+    (0xC503320, "00000000", "C0035FD6", True),
+    (0x1175FF4, "00000000", "709C05D0", True),
+    (0x1175FF8, "00000000", "10420791", True),
+    (0x1175FFC, "00000000", "00021FD6", True),
+]
+PARTNER5 = [
+    (0x117B744, "D77E0094", "2CEAFF97", True),
+    (0x1186554, "53530094", "A8BEFF97", True),
+    (0x118D0D0, "74380094", "C9A3FF97", True),
+]
+
+ORDER = [PARTNER5_CAVE, PARTNER5]
+CAVES = {'PARTNER5': 0xC5031D0, 'TRAMP': 0x1175FF4}

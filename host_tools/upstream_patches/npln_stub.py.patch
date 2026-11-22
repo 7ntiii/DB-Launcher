@@ -1,0 +1,459 @@
+--- a/npln_stub.py
++++ b/npln_stub.py
+@@ -20,7 +20,7 @@
+ game-facing services (e.g. --host 127.0.0.1,10.0.0.202 so a second PC on
+ the home network can play; the status page and admin panel stay on --web-host).
+ """
+-import argparse, base64, copy, json, math, os, queue, re, secrets, socket, struct, sys, threading, time
++import argparse, base64, copy, hashlib, hmac, json, math, os, queue, re, secrets, socket, struct, sys, threading, time
+ from collections import Counter, defaultdict, deque
+ from concurrent import futures
+ from pathlib import Path
+@@ -179,6 +179,11 @@
+         if n == 5 and isinstance(v, int):
+             return Fixed64(v)
+         if n in (7, 11):
++            if isinstance(v, dict) and 'hex' in v:
++                # LAN fix (2026-11-11): strings with line breaks (Pia's SDP "sd" with CRLF, its
++                # certificate "ssc") are not "printable", so decode() kept them as raw bytes and
++                # they reached the other player as "": it never answered the connection offer.
++                return bytes.fromhex(v['hex']).decode('utf-8', 'replace')
+             return v if isinstance(v, str) else ''
+         if n == 8:  # bytes: keep them bytes, or a reader of bytes gets nothing (Pia's "pl")
+             if isinstance(v, dict) and 'hex' in v:
+@@ -348,7 +353,15 @@
+         """A login: a player with a friend code keeps the same user id (code_uid) every time;
+         without one each login is a new user."""
+         with self.lock:
+-            if code:
++            if code and peer_ip in ('127.0.0.1', '::1') and os.environ.get('DUSK_HOST_FIRST', '0') == '1' \
++                    and getattr(self, 'host_code', code) == code:
++                # HOST FIRST (2026-11-21): the game sorts players by this id; the lowest is player 1 and
++                # holds the match clock, enemies and shared decisions. The host PC's own game (the only
++                # one that signs in from 127.0.0.1) gets a fixed id below every friend-code id, so the
++                # host PC is always player 1. OFF BY DEFAULT since 16:55: the game takes its OWN id from the emulator's code, not from here, so the host had two ids (0x1000001 for the others, its code for itself). On: DUSK_HOST_FIRST=1.
++                self.host_code = code
++                uid = HOST_FIRST_UID
++            elif code:
+                 uid = code_uid(code)
+             else:
+                 uid = f'u-{self.next_user:016x}'
+@@ -1045,13 +1058,50 @@
+                      if call['uid'] in s['members']), None)
+ 
+ 
++# --- LAN fix (2026-11-11): Duskbloods joins a game session with an EMPTY name after its own
++# match server (fromsoftware frontend) says MATCHED; FromSoftware's servers made that session.
++# Pair such joins: the first caller opens a session, anyone joining within LAN_PAIR_SECONDS is
++# added to it (and the others are told, as for rooms).
++LAN_PAIR_SECONDS = float(os.environ.get('DUSK_LAN_PAIR_SECONDS', '12'))
++LAN_PAIR = {'sid': None}
++
++
++def lan_pair_session(call):
++    uid = call['uid']
++    now = time.time()
++    with STATE.lock:
++        cur = STATE.sessions.get(LAN_PAIR['sid']) if LAN_PAIR['sid'] else None
++        fresh = cur is not None and now - cur['created'] <= LAN_PAIR_SECONDS
++    if fresh:
++        if uid not in cur['members']:
++            add_room_member(cur, uid, call.get('log'), limit=8)
++            call['log'](ev='lan-pair-join', session=cur['id'], uid=uid, members=cur['members'])
++        return cur
++    with STATE.lock:
++        tenant = STATE.tenant_of(uid) if hasattr(STATE, 'tenant_of') else STATE.tenant
++        sid = f'gs-{len(STATE.sessions) + 1:04d}'
++        s = {'id': sid, 'name': f'tenants/{tenant}/gameSessions/{sid}', 'tenant': tenant,
++             'created': now, 'host': uid, 'members': [uid], 'tickets': [None], 'config': '',
++             'max_players': 8, 'attributes': {}, 'updated': {}, 'watchers': [], 'vars': {},
++             'deferments': {}, 'lan': True}
++        s['docs'] = session_docs(s)
++        STATE.sessions[sid] = s
++        STATE.joined[uid] = sid
++        LAN_PAIR['sid'] = sid
++    call['log'](ev='lan-pair-open', session=sid, uid=uid)
++    return s
++
++
+ @reply('JoinGameSession')
+ def join_game_session(req, call):
+     # Request: 1 the game session, 3 the joiner as a TicketMember (Mario Kart World's attributes
+     # carry its version). Reply #105: 1 members (#125), 2 the session.
+     # Joining a room adds the caller to it (matchmade sessions have their members already), unless
+     # the room was made on another version or build of the game (when both are known).
+-    s = session_for(req, call)
++    if first_string(req, 1).endswith('/gameSessions/'):   # Duskbloods after its own MATCHED
++        s = lan_pair_session(call)
++    else:
++        s = session_for(req, call)
+     joiner = next((member_version(m) for m in submsgs(decode(req), 3)), None)
+     STATE.note_version(call['uid'], joiner)
+     joiner = joiner or STATE.user_version(call['uid'])
+@@ -1068,7 +1118,55 @@
+     if s and s.get('room') and not add_room_member(s, call['uid'], call.get('log')):
+         raise RpcError(grpc.StatusCode.RESOURCE_EXHAUSTED,
+                        f'room {s["id"]} is {"closed" if s.get("closed") else "full"}')
+-    return b''.join(field(1, e) for e in member_entries(s)) + field(2, game_session_msg(s)) if s else b''
++    if not s:
++        return b''
++    entries = member_entries(s)
++    if s.get('lan') and call['uid'] in s['members']:
++        # LAN pairing: each game takes the FIRST member entry as its own (2-PC test 09:20: both
++        # games used player 1's user session), so put the caller's entry first.
++        i = s['members'].index(call['uid'])
++        entries = entries[i:i + 1] + entries[:i] + entries[i + 1:]
++    return b''.join(field(1, e) for e in entries) + field(2, game_session_msg(s))
++
++
++# --- LAN fix (2026-11-11): QueryUserExternalIds ------------------------------------------------
++# Duskbloods asks for each P2P peer's external id right after the peer's QUIC connection is
++# attached. An empty reply makes the peer state machine leave and Close(0) the connection at once
++# (the APPLICATION_ERROR seen on the wire 85 ms after the ClientHello). Reverse engineered
++# (main 0x38cfe0 / 0x48d7b40, protobuf-lite parsers 0x3c43a0 / 0x3c76c0 / 0x3c8420):
++#   request  {1 parent, 3 repeated {1 "tenants/{t}/users/{u}", 2 packed id types}}
++#   response {1 repeated Entry}; Entry {1 string (unused), 2 user name, the game ABORTS on a
++#            name that is not "tenants/{t}/users/{u}"; 3 {1 type, 2 id as a hex string, must be
++#            non-zero}; 4 Timestamp (optional)}
++# The game keys the ids by {u} and stores the peer's at peer+0x90; it must differ from the
++# game's own id. Here: the id is the user id's own hex number.
++@reply('QueryUserExternalIds')
++def query_user_external_ids(req, call):
++    out = b''
++    for q in submsgs(decode(req), 3):
++        name = substr(q, 1)
++        if not re.fullmatch(r'tenants/[^/]+/users/[^/]+', name):
++            continue
++        raw = next((v for n, wt, v in q if n == 2), None)
++        types = []
++        if isinstance(raw, dict) and 'hex' in raw:
++            b, i = bytes.fromhex(raw['hex']), 0
++            while i < len(b):
++                t, i = read_varint(b, i)
++                types.append(t)
++        elif isinstance(raw, int):
++            types.append(raw)
++        uid = name.rsplit('/', 1)[-1]
++        try:
++            ext = int(uid[2:], 16) or 1
++        except ValueError:
++            ext = int.from_bytes(hashlib.sha256(uid.encode()).digest()[:8], 'big') or 1
++        for t in types or [1]:
++            out += field(1, field(1, f'{name}/externalIds/{t}') + field(2, name)
++                         + field(3, field(1, t) + field(2, f'{ext:016x}')))
++    call['log'](ev='external-ids', users=[substr(q, 1) for q in submsgs(decode(req), 3)],
++                bytes=len(out))
++    return out
+ 
+ 
+ # --- rooms: the Hideout's Online Play desk ------------------------------------------------------
+@@ -1253,6 +1351,14 @@
+ format_code = npln_accounts.format_code  # 123456789012 -> "SW-1234-5678-9012"
+ 
+ 
++HOST_FIRST_UID = f'u-{0x1000001:016x}'   # below every 12-digit friend code that matters (see new_user)
++
++
++def player_uid(code):
++    """The user id a player with this friend code has right now (the host PC's game: HOST_FIRST_UID)."""
++    return HOST_FIRST_UID if getattr(STATE, 'host_code', None) == code else code_uid(code)
++
++
+ def code_uid(code):
+     """A friend code's fixed NPLN user id."""
+     return f'u-{int(code):016x}'
+@@ -1311,7 +1417,7 @@
+     if not code:
+         return b''
+     tenant = STATE.tenant_of(call['uid'])
+-    return b''.join(field(1, field(1, f'{int(f):x}') + field(2, field(2, user_name(code_uid(f), tenant))))
++    return b''.join(field(1, field(1, f'{int(f):x}') + field(2, field(2, user_name(player_uid(f), tenant))))
+                     for f in ACCOUNTS.friends_of(code))
+ 
+ 
+@@ -1333,7 +1439,7 @@
+     if not code:
+         return b''
+     now, tenant = time.time(), STATE.tenant_of(call['uid'])
+-    body = b''.join(field(1, presence_msg(code_uid(f), now, tenant)) for f in ACCOUNTS.friends_of(code))
++    body = b''.join(field(1, presence_msg(player_uid(f), now, tenant)) for f in ACCOUNTS.friends_of(code))
+     return field(1, body + field(2, 'p'))
+ 
+ 
+@@ -1881,6 +1987,12 @@
+ ICE_UDP = 1  # ICE protocol enum: 1 UDP, 2 TCP, 3 TLS
+ 
+ 
++# Field 6 (a Duration) left out reads as 0: on LAN (2-PC test 9, 2026-11-11) both games' QUIC P2P
++# connections closed themselves (APPLICATION_ERROR, no reason) at the first timer tick after
++# their first flight, nothing received - an already expired handshake timeout. Give it one.
++ICE_SET_TIMEOUT = int(os.environ.get('DUSK_ICE_SET_TIMEOUT', '15'))
++
++
+ @reply('AllocateIceServerSet')
+ def allocate_ice_server_set(req, call):
+     # Reply #130: 1 name, 2 a STUN-like server #131 {1 host, 2 port,
+@@ -1892,7 +2004,8 @@
+     relay = (field(1, RELAY_NAME) + field(2, RELAY_PORT) + field(3, ICE_UDP)
+              + field(4, call['uid'] or 'relay') + field(5, jwt_for(call['uid'] or 'relay')))
+     return (field(1, f'tenants/{tenant}/iceServerSets/local') + field(2, stun) + field(3, relay)
+-            + field(4, timestamp(600)) + field(5, timestamp(time.time() + 600)))
++            + field(4, timestamp(600)) + field(5, timestamp(time.time() + 600))
++            + field(6, timestamp(ICE_SET_TIMEOUT)))
+ 
+ 
+ # PresenceService/KeepAlive replies (M044, a oneof): 1 M058 {1, 2 Durations}, the server's
+@@ -2187,6 +2300,15 @@
+ STUN_COOKIE = 0x2112A442
+ 
+ 
++def _lan_visible(ip):
++    """LAN fix (2026-11-11): a game on this PC reaches the stub over loopback, and a STUN reply of
++    127.0.0.1 became its "server reflexive" ICE candidate, useless to the other PC. Report this
++    PC's LAN address instead (the game's socket is bound to all interfaces, same port)."""
++    if ip.startswith('127.'):
++        return _turn_relay_ip('127.0.0.1')
++    return ip
++
++
+ def ice_server(log, host, port):
+     """The ICE servers AllocateIceServerSet hands out: log every packet, and answer a standard
+     STUN binding request (RFC 5389) with the sender's address, in case Pia uses plain STUN."""
+@@ -2198,12 +2320,214 @@
+         log(ev='ice-udp', port=port, src=f'{ip}:{sport}', size=len(data), hex=data[:256].hex())
+         if len(data) >= 20 and data[:2] == b'\x00\x01' and \
+                 struct.unpack('>I', data[4:8])[0] == STUN_COOKIE:
+-            packed_ip = struct.unpack('>I', socket.inet_aton(ip))[0]
++            packed_ip = struct.unpack('>I', socket.inet_aton(_lan_visible(ip)))[0]
+             attrs = struct.pack('>HHBBHI', 0x0020, 8, 0, 1, sport ^ (STUN_COOKIE >> 16),
+                                 packed_ip ^ STUN_COOKIE)                    # XOR-MAPPED-ADDRESS
+-            attrs += struct.pack('>HHBBH4s', 0x0001, 8, 0, 1, sport, socket.inet_aton(ip))
++            attrs += struct.pack('>HHBBH4s', 0x0001, 8, 0, 1, sport, socket.inet_aton(_lan_visible(ip)))
+             sock.sendto(struct.pack('>HHI12s', 0x0101, len(attrs), STUN_COOKIE, data[8:20]) + attrs,
+                         (ip, sport))
++        elif (len(data) >= 20 and data[:2] == bytes((0, 3))
++                and struct.unpack('>I', data[4:8])[0] == STUN_COOKIE):
++            # LAN fix (2026-11-11): a TURN Allocate left unanswered made Duskbloods retry for ~20 s
++            # and drop the match before writing its ICE candidates. No relay is needed on a LAN:
++            # refuse at once (403 Forbidden) so it goes on with its direct (host/srflx) candidates.
++            reason = b'Forbidden'
++            reason += b' ' * (-len(reason) % 4)
++            err = struct.pack('>HHHBB', 0x0009, 4 + len(reason), 0, 4, 3) + reason   # ERROR-CODE 403
++            sock.sendto(struct.pack('>HHI12s', 0x0113, len(err), STUN_COOKIE, data[8:20]) + err,
++                        (ip, sport))
++            log(ev='ice-turn-refused', port=port, src=f'{ip}:{sport}')
++
++# --- LAN fix (2026-11-11): a minimal TURN relay (RFC 5766, UDP, long-term credentials) ----------
++# 2-PC test 4: with the relay Allocate refused, Duskbloods never filled its connection offer
++# ("sd") and dropped the match after ~21 s, so Pia wants a working relay. Credentials are the
++# ones AllocateIceServerSet hands out (username = user id, password = its jwt_for token).
++TURN_REALM = 'npln.local'
++TURN_LIFETIME = 600
++STUN_MAGIC = struct.pack('>I', 0x2112A442)
++
++
++def _turn_relay_ip(host):
++    # Tailscale play (tailscale_support.diff): a listener on one of this PC's addresses announces
++    # its relays at that address (the one its clients reached), so a client on Tailscale gets a
++    # 100.x relay and one on the home network a home one. The loopback listener (this PC's own
++    # game) takes DUSK_ADVERTISE_IP, the host script's choice (the launcher sets DUSK_HOST_IP).
++    if os.environ.get('DUSK_TAILSCALE') == '1':
++        if host not in ('127.0.0.1', '0.0.0.0', '') and not host.startswith('127.'):
++            return host
++        if os.environ.get('DUSK_ADVERTISE_IP'):
++            return os.environ['DUSK_ADVERTISE_IP']
++    ip = os.environ.get('DUSK_HOST_IP') or ''
++    if not ip and host not in ('127.0.0.1', '0.0.0.0', ''):
++        ip = host
++    if not ip:
++        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        try:
++            s.connect(('192.168.0.1', 9))
++            ip = s.getsockname()[0]
++        except OSError:
++            ip = '127.0.0.1'
++        finally:
++            s.close()
++    return ip
++
++
++def _xaddr(ip, port):
++    return struct.pack('>BBH4s', 0, 1, port ^ 0x2112,
++                       bytes(a ^ b for a, b in zip(socket.inet_aton(ip), STUN_MAGIC)))
++
++
++def _unxaddr(v):
++    port = struct.unpack('>H', v[2:4])[0] ^ 0x2112
++    return socket.inet_ntoa(bytes(a ^ b for a, b in zip(v[4:8], STUN_MAGIC))), port
++
++
++def _stun_attrs(msg):
++    out, i = [], 20
++    while i + 4 <= len(msg):
++        t, n = struct.unpack('>HH', msg[i:i + 4])
++        out.append((t, msg[i + 4:i + 4 + n]))
++        i += 4 + n + (-n % 4)
++    return out
++
++
++def _stun_attr(t, v):
++    return struct.pack('>HH', t, len(v)) + v + b'\0' * (-len(v) % 4)
++
++
++def _stun_msg(mtype, tid, attrs, key=None):
++    body = b''.join(_stun_attr(t, v) for t, v in attrs)
++    if key is not None:   # MESSAGE-INTEGRITY over the message, its length already counting the MI
++        head = struct.pack('>HH', mtype, len(body) + 24) + STUN_MAGIC + tid
++        body += _stun_attr(0x0008, hmac.new(key, head + body, hashlib.sha1).digest())
++    return struct.pack('>HH', mtype, len(body)) + STUN_MAGIC + tid + body
++
++
++def turn_server(log, host, port):
++    """STUN binding + a TURN relay on host:port. Each allocation gets its own UDP socket, announced
++    at this PC's LAN address; ChannelData, Send and Data indications are relayed both ways."""
++    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++    sock.bind((host, port))
++    log(ev='turn-listening', host=host, port=port)
++    relay_ip = _turn_relay_ip(host)
++    nonce = secrets.token_hex(8).encode()
++    allocs = {}           # client (ip, port) -> allocation
++    lock = threading.Lock()
++
++    def pump(client, a):
++        rs = a['sock']
++        while not a.get('closed'):
++            try:
++                data, peer = rs.recvfrom(65536)
++            except OSError:
++                return
++            with lock:
++                num = a['peer'].get(peer)
++            if num is not None:
++                pkt = struct.pack('>HH', num, len(data)) + data + b'\0' * (-len(data) % 4)
++            else:
++                pkt = _stun_msg(0x0117, secrets.token_bytes(12),
++                                [(0x0012, _xaddr(*peer)), (0x0013, data)])
++            try:
++                sock.sendto(pkt, client)
++            except OSError:
++                pass
++            if a['n_in'] < 5:
++                a['n_in'] += 1
++                log(ev='turn-relay-in', client=f'{client[0]}:{client[1]}',
++                    peer=f'{peer[0]}:{peer[1]}', size=len(data))
++
++    while True:
++        try:
++            data, client = sock.recvfrom(65536)
++        except OSError:
++            continue
++        try:
++            if len(data) >= 4 and 0x40 <= data[0] <= 0x7F:          # ChannelData
++                num, n = struct.unpack('>HH', data[:4])
++                with lock:
++                    a = allocs.get(client)
++                    peer = a['chan'].get(num) if a else None
++                if peer:
++                    a['sock'].sendto(data[4:4 + n], peer)
++                    if a['n_out'] < 5:
++                        a['n_out'] += 1
++                        log(ev='turn-relay-out', client=f'{client[0]}:{client[1]}',
++                            peer=f'{peer[0]}:{peer[1]}', size=n)
++                continue
++            if len(data) < 20 or data[4:8] != STUN_MAGIC:
++                log(ev='ice-udp', port=port, src=f'{client[0]}:{client[1]}', size=len(data),
++                    hex=data[:64].hex())
++                continue
++            mtype = struct.unpack('>H', data[:2])[0]
++            tid = data[8:20]
++            attrs = dict(_stun_attrs(data))
++            if mtype == 0x0001:                                       # Binding
++                sock.sendto(_stun_msg(0x0101, tid, [(0x0020, _xaddr(_lan_visible(client[0]), client[1]))]),
++                            client)
++                continue
++            if mtype == 0x0016:                                       # Send indication
++                with lock:
++                    a = allocs.get(client)
++                if a and 0x0012 in attrs and 0x0013 in attrs:
++                    a['sock'].sendto(attrs[0x0013], _unxaddr(attrs[0x0012]))
++                    if a['n_out'] < 5:
++                        a['n_out'] += 1
++                        log(ev='turn-send', client=f'{client[0]}:{client[1]}',
++                            peer='%s:%d' % _unxaddr(attrs[0x0012]), size=len(attrs[0x0013]))
++                continue
++            user = attrs.get(0x0006)
++            if user is None or 0x0008 not in attrs:                   # ask for credentials
++                sock.sendto(_stun_msg(mtype | 0x0110, tid, [
++                    (0x0009, struct.pack('>HBB', 0, 4, 1) + b'Unauthorized'),
++                    (0x0014, TURN_REALM.encode()), (0x0015, nonce)]), client)
++                log(ev='turn-401', method=hex(mtype), client=f'{client[0]}:{client[1]}')
++                continue
++            uid = user.decode('utf-8', 'replace')
++            key = hashlib.md5(f'{uid}:{TURN_REALM}:{jwt_for(uid)}'.encode()).digest()
++            method = mtype & 0x3EEF
++            if method == 0x0003:                                      # Allocate
++                with lock:
++                    a = allocs.get(client)
++                    if a is None:
++                        rs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++                        rs.bind(('0.0.0.0', 0))
++                        a = allocs[client] = {'sock': rs, 'chan': {}, 'peer': {}, 'n_in': 0, 'n_out': 0}
++                        threading.Thread(target=pump, args=(client, a), daemon=True).start()
++                rport = a['sock'].getsockname()[1]
++                log(ev='turn-allocate', client=f'{client[0]}:{client[1]}', user=uid,
++                    relay=f'{relay_ip}:{rport}')
++                sock.sendto(_stun_msg(0x0103, tid, [(0x0016, _xaddr(relay_ip, rport)),
++                                                    (0x0020, _xaddr(_lan_visible(client[0]), client[1])),
++                                                    (0x000D, struct.pack('>I', TURN_LIFETIME))],
++                                      key), client)
++            elif method == 0x0004:                                    # Refresh
++                life = attrs.get(0x000D, struct.pack('>I', TURN_LIFETIME))[:4]
++                if struct.unpack('>I', life)[0] == 0:
++                    with lock:
++                        a = allocs.pop(client, None)
++                    if a:
++                        a['closed'] = True
++                        a['sock'].close()
++                sock.sendto(_stun_msg(0x0104, tid, [(0x000D, life)], key), client)
++            elif method == 0x0008:                                    # CreatePermission
++                sock.sendto(_stun_msg(0x0108, tid, [], key), client)
++                log(ev='turn-permission', client=f'{client[0]}:{client[1]}')
++            elif method == 0x0009:                                    # ChannelBind
++                num = struct.unpack('>H', attrs.get(0x000C, b'\0\0')[:2])[0]
++                peer = _unxaddr(attrs[0x0012]) if 0x0012 in attrs else None
++                with lock:
++                    a = allocs.get(client)
++                    if a and peer:
++                        a['chan'][num] = peer
++                        a['peer'][peer] = num
++                log(ev='turn-channel', client=f'{client[0]}:{client[1]}', channel=num,
++                    peer=f'{peer[0]}:{peer[1]}' if peer else None)
++                sock.sendto(_stun_msg(0x0109, tid, [], key), client)
++            else:
++                log(ev='turn-unknown', method=hex(mtype), client=f'{client[0]}:{client[1]}')
++        except Exception as exc:   # one bad packet must not stop the relay
++            log(ev='turn-error', error=repr(exc), client=f'{client[0]}:{client[1]}')
+ 
+ 
+ def ice_tcp_logger(log, host, port):
+@@ -2307,7 +2631,9 @@
+             ap.error(f'--host {h}: only loopback, private (RFC 1918), link-local and mesh-VPN '
+                      f'addresses; add --public for a server on the internet')
+     global NAT_IP
+-    NAT_IP = args.nat_ip or next((h for h in hosts if not h.startswith('127.') and h != '0.0.0.0'), None)
++    # tailscale_support.diff: the host script's address wins over the launcher's --nat-ip (its first)
++    NAT_IP = (os.environ.get('DUSK_ADVERTISE_IP') or args.nat_ip
++              or next((h for h in hosts if not h.startswith('127.') and h != '0.0.0.0'), None))
+     log = Log(args.log, args.quiet_log)
+     global ACCOUNTS
+     STATE = State(data / 'admin-audit.jsonl')
+@@ -2336,7 +2662,8 @@
+                              daemon=True).start()
+         threading.Thread(target=monitoring_server, args=(log, host, 34343), daemon=True).start()
+         for ice_port in (STUN_PORT, RELAY_PORT):
+-            threading.Thread(target=ice_server, args=(log, host, ice_port), daemon=True).start()
++            threading.Thread(target=turn_server if ice_port == RELAY_PORT else ice_server,
++                             args=(log, host, ice_port), daemon=True).start()
+             threading.Thread(target=ice_tcp_logger, args=(log, host, ice_port), daemon=True).start()
+     npln_dashboard.serve(STATE, args.web_host, args.web_port, auth, log, args.trust_proxy, ACCOUNTS, pki)
+ 

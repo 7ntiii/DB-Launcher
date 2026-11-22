@@ -1,0 +1,40 @@
+DB-LAUNCHER - LICENSES AND CREDITS
+
+This project is free software under the GNU General Public License, version 3 or (at your option) any
+later version. The full text is in LICENSE.txt. It comes with NO WARRANTY.
+
+WHAT IS IN A PACKAGE, AND WHOSE IT IS
+
+1. The launcher ("DB-Launcher Host.exe", "DB-Launcher Join.exe"; source: the "launcher" folder of the
+   project's repository). Written from zero for this project. GPL-3.0-or-later.
+   Packed inside the program so it runs without installing anything: Python (Python Software
+   Foundation License), the "cryptography" package (Apache-2.0 or BSD-3-Clause), gRPC for Python
+   (Apache-2.0), and the packages those need, each under its own license.
+
+2. The emulator (the "Lichii" folder). A changed build of Lichii, https://github.com/zortos293/Lichii,
+   GPL-3.0-or-later. Lichii builds on the Eglantine, Eden, yuzu and Sudachi projects and their
+   contributors; their copyright notices stay in the source files.
+   What this project changed: play over a home network or VPN for the network test (sockets and
+   online redirect, the LAN assist, start-up and data-folder behaviour, shader cache carry-over).
+   Every change is published as source in the project's repository, folder "emulator": two patch
+   files against the Lichii commit named in emulator/UPSTREAM.txt. The repository is the place this
+   package is offered from; the source there is the "corresponding source" the license speaks of.
+   Shipped beside the emulator, each under its own license: Qt 6 (LGPL-3.0; the Qt6*.dll files and
+   the plugins folder can be replaced by your own build of Qt 6.8), the DirectX Shader Compiler files
+   (dxcompiler.dll, dxil.dll; Microsoft's terms), flyhigh (see Lichii/licenses/flyhigh). The licenses
+   of the libraries built into lichii.exe are listed in the "LICENSES" folder of the Lichii source.
+
+3. The "servers" folder (the room servers a host runs). These files are the work of sikoGD, from the
+   project playDB-CNT: https://github.com/sikoGD/playDB-CNT . Without them this project would not
+   exist: thank you, sikoGD. Two of the files (frontend_api.py, npln_stub.py) carry changes of ours for
+   play over a home network or VPN. The room servers remain their author's work and are not covered
+   by this project's license; for any other use of them, ask their author.
+
+4. vc_redist.x64.exe, when a package has one: Microsoft's Visual C++ runtime installer, under
+   Microsoft's terms.
+
+NOT INCLUDED
+No game, no game data and no keys are part of this project. You need your own.
+
+This is a fan project. It is not affiliated with, endorsed by or connected to the makers or publishers
+of any game or console.
